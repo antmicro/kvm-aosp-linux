@@ -112,6 +112,8 @@ struct kvm_debug_exit_arch {
 };
 
 struct kvm_sync_regs {
+	/* Used with KVM_CAP_ARM_TIMER */
+	u8 timer_irq_level;
 };
 
 struct kvm_arch_memory_slot {
