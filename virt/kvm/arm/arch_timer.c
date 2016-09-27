@@ -163,6 +163,22 @@ bool kvm_timer_should_fire(struct kvm_vcpu *vcpu)
 	return cval <= now;
 }
 
+/*
+ * Reflect the timer output level into the kvm_run structure
+ */
+void kvm_timer_update_run(struct kvm_vcpu *vcpu)
+{
+	struct kvm_sync_regs *regs = &vcpu->run->s.regs;
+
+	if (likely(irqchip_in_kernel(vcpu->kvm)))
+		return;
+
+	/* Populate the timer bitmap for user space */
+	regs->timer_irq_level &= ~KVM_ARM_TIMER_VTIMER;
+	if (vcpu->arch.timer_cpu.irq.level)
+		regs->timer_irq_level |= KVM_ARM_TIMER_VTIMER;
+}
+
 static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level)
 {
 	int ret;
@@ -170,12 +186,17 @@ static void kvm_timer_update_irq(struct kvm_vcpu *vcpu, bool new_level)
 
 	timer->active_cleared_last = false;
 	timer->irq.level = new_level;
-	trace_kvm_timer_update_irq(vcpu->vcpu_id, timer->irq.irq,
+	trace_kvm_timer_update_irq(vcpu->vcpu_id, host_vtimer_irq,
 				   timer->irq.level);
-	ret = kvm_vgic_inject_mapped_irq(vcpu->kvm, vcpu->vcpu_id,
-					 timer->irq.irq,
-					 timer->irq.level);
-	WARN_ON(ret);
+
+	if (likely(irqchip_in_kernel(vcpu->kvm))) {
+		/* Fire the timer in the VGIC */
+		ret = kvm_vgic_inject_mapped_irq(vcpu->kvm, vcpu->vcpu_id,
+						 timer->irq.irq,
+						 timer->irq.level);
+
+		WARN_ON(ret);
+	}
 }
 
 /*
@@ -192,7 +213,7 @@ static void kvm_timer_update_state(struct kvm_vcpu *vcpu)
 	 * because the guest would never see the interrupt.  Instead wait
 	 * until we call this function from kvm_timer_flush_hwstate.
 	 */
-	if (!timer->enabled)
+	if (unlikely(!timer->enabled))
 		return;
 
 	if (kvm_timer_should_fire(vcpu) != timer->irq.level)
@@ -235,23 +256,11 @@ void kvm_timer_unschedule(struct kvm_vcpu *vcpu)
 	timer_disarm(timer);
 }
 
-/**
- * kvm_timer_flush_hwstate - prepare to move the virt timer to the cpu
- * @vcpu: The vcpu pointer
- *
- * Check if the virtual timer has expired while we were running in the host,
- * and inject an interrupt if that was the case.
- */
-void kvm_timer_flush_hwstate(struct kvm_vcpu *vcpu)
+static void kvm_timer_flush_hwstate_vgic(struct kvm_vcpu *vcpu)
 {
 	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
 	bool phys_active;
 	int ret;
-
-	if (unlikely(!timer->enabled))
-		return;
-
-	kvm_timer_update_state(vcpu);
 
 	/*
 	* If we enter the guest with the virtual input level to the VGIC
@@ -302,6 +311,56 @@ void kvm_timer_flush_hwstate(struct kvm_vcpu *vcpu)
 	WARN_ON(ret);
 
 	timer->active_cleared_last = !phys_active;
+}
+
+bool kvm_timer_should_notify_user(struct kvm_vcpu *vcpu)
+{
+	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
+	bool run_level = vcpu->run->s.regs.timer_irq_level & KVM_ARM_TIMER_VTIMER;
+
+	if (likely(irqchip_in_kernel(vcpu->kvm)))
+		return false;
+
+	return timer->irq.level != run_level;
+}
+
+static void kvm_timer_flush_hwstate_user(struct kvm_vcpu *vcpu)
+{
+	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
+
+	/*
+	 * To prevent continuously exiting from the guest, we mask the
+	 * physical interrupt such that the guest can make forward progress.
+	 * Once we detect the output level being deasserted, we unmask the
+	 * interrupt again so that we exit from the guest when the timer
+	 * fires.
+	*/
+	if (timer->irq.level)
+		disable_percpu_irq(host_vtimer_irq);
+	else
+		enable_percpu_irq(host_vtimer_irq, 0);
+}
+
+/**
+ * kvm_timer_flush_hwstate - prepare to move the virt timer to the cpu
+ * @vcpu: The vcpu pointer
+ *
+ * Check if the virtual timer has expired while we were running in the host,
+ * and inject an interrupt if that was the case.
+ */
+void kvm_timer_flush_hwstate(struct kvm_vcpu *vcpu)
+{
+	struct arch_timer_cpu *timer = &vcpu->arch.timer_cpu;
+
+	if (unlikely(!timer->enabled))
+		return;
+
+	kvm_timer_update_state(vcpu);
+
+	if (unlikely(!irqchip_in_kernel(vcpu->kvm)))
+		kvm_timer_flush_hwstate_user(vcpu);
+	else
+		kvm_timer_flush_hwstate_vgic(vcpu);
 }
 
 /**
@@ -470,6 +529,13 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
 	if (timer->enabled)
 		return 0;
 
+	/* Without a VGIC we do not map virtual IRQs to physical IRQs */
+	if (!irqchip_in_kernel(vcpu->kvm))
+		goto no_vgic;
+
+	if (!vgic_initialized(vcpu->kvm))
+		return -ENODEV;
+
 	/*
 	 * Find the physical IRQ number corresponding to the host_vtimer_irq
 	 */
@@ -493,6 +559,7 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
 	if (ret)
 		return ret;
 
+no_vgic:
 
 	/*
 	 * There is a potential race here between VCPUs starting for the first
